@@ -1,0 +1,5 @@
+priawarevenv/
+.env
+__pycache__/
+
+
