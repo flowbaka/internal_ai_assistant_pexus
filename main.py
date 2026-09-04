@@ -28,6 +28,39 @@ class QuestionRequest(BaseModel):
     question: str
 
 
+# RAG cannot properly search an entire document as one huge piece, so we divide it into smaller chunks. This is a simple implementation and can be improved with more advanced chunking strategies.
+
+# function to split text into chunks of a specified size
+def split_text(
+        text:str, 
+        chunk_size:int = 200,
+        overlap:int = 30, 
+) -> list[str]:
+    if overlap >= chunk_size:
+        raise ValueError("Overlap must be smaller than chunk size.")
+
+    words = text.split()
+    chunks = []
+    start = 0
+
+    while start < len(words):
+        end = start + chunk_size
+
+        chunck_words = words[start:end]
+        chunk = " ".join(chunck_words)
+
+        chunck.append(chunk)
+
+        if end >= len(words):
+            break
+
+        start = end - overlap
+
+    return chunks
+
+
+
+
 @app.get("/")
 def root():
     return {
