@@ -40,7 +40,7 @@ chroma_client = chromadb.PersistentClient(
 )
 
 document_collection = chroma_client.get_or_create_collection(
-    name="internal documents"
+    name="internal_documents"
 )
 
 # Create FastAPI application
