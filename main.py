@@ -5,6 +5,7 @@ from fastapi import  FastAPI, HTTPException, UploadFile
 from google import genai
 from pydantic import BaseModel
 from pypdf import PdfReader
+from sentence_transformers import SentenceTransformer
 
 load_dotenv()
 
@@ -15,6 +16,12 @@ if not api_key:
     raise ValueError("Gemini_api_key environment variable is not set or found in .env.")
 
 client = genai.Client(api_key=api_key)
+
+embedding_model = SentenceTransformer(
+    "sentence-transformers/all-MiniLM-L6-v2"
+)
+
+
 
 
 
@@ -60,6 +67,10 @@ def split_text(
 
 
 
+def create_embeddings(chunks: list[str]) -> list[list[float]]:
+    embeddings = embedding_model.encode(chunks)
+    return embeddings.tolist()
+
 
 @app.get("/")
 def root():
@@ -104,7 +115,7 @@ async def extract_document(file: UploadFile):
     try: 
         reader = PdfReader(file.file)
 
-        extracted_text = []
+        extracted_pages = []
 
         for page_number, page in enumerate(reader.pages, start = 1):
             page_text = page.extract_text() or ""
@@ -127,11 +138,13 @@ async def extract_document(file: UploadFile):
                 detail="No text could be extracted from the PDF file."
             )
 
+        
         return {
             "filename": file.filename,
             "page_count": len(extracted_pages),
             "character_count": len(full_text),
-            "text": full_text,
+            "chunk_count": len(chunks),
+            "chunks": chunks,
         }
 
 
