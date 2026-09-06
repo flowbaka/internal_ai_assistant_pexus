@@ -8,6 +8,10 @@ from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from uuid import uuid4
 
+from privacy import mask_sensitive_data
+
+
+
 import chromadb
 
 
@@ -174,6 +178,49 @@ def retrieve_relevant_chunks(
 
     return matches
 
+def retrieve_relevant_chunks(
+    question: str,
+    number_of_results: int = 3,
+) -> list[dict]:
+    stored_chunk_count = document_collection.count()
+
+    if stored_chunk_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No documents have been uploaded",
+        )
+
+    question_embedding = create_embeddings([question])[0]
+
+    results = document_collection.query(
+        query_embeddings=[question_embedding],
+        n_results=min(
+            number_of_results,
+            stored_chunk_count,
+        ),
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    matches = []
+
+    for document, metadata, distance in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        matches.append({
+            "text": document,
+            "filename": metadata["filename"],
+            "chunk_number": metadata["chunk_number"],
+            "distance": round(float(distance), 4),
+        })
+
+    return matches
+
 @app.get("/")
 def home():
     return {
@@ -288,7 +335,7 @@ def search_documents(request: QuestionRequest):
         "question": request.question,
         "matches": matches,
     }
-    stored_chunk_count = document_collection.count()
+
 
 @app.post("/documents/ask")
 def ask_document(request: QuestionRequest):
@@ -296,32 +343,51 @@ def ask_document(request: QuestionRequest):
         request.question
     )
 
-    context_sections = []
+    masked_question, redaction_counts = (
+        mask_sensitive_data(request.question)
+    )
 
-    for index, match in enumerate(matches, start=1):
-        context_sections.append(
-            f"""
-Source {index}
-Filename: {match["filename"]}
-Chunk: {match["chunk_number"]}
-Content:
-{match["text"]}
-"""
+    safe_matches = []
+
+    for match in matches:
+        masked_text, chunk_redactions = (
+            mask_sensitive_data(match["text"])
         )
 
-    context = "\n".join(context_sections)
+        for category, count in chunk_redactions.items():
+            redaction_counts[category] += count
+
+        safe_match = match.copy()
+        safe_match["text"] = masked_text
+
+        safe_matches.append(safe_match)
+
+    context_sections = []
+
+    for index, match in enumerate(safe_matches, start=1):
+        source = (
+            f"Source {index}\n"
+            f"Filename: {match['filename']}\n"
+            f"Chunk: {match['chunk_number']}\n"
+            f"Content: {match['text']}"
+        )
+
+        context_sections.append(source)
+
+    context = "\n\n".join(context_sections)
 
     prompt = f"""
 You are an internal document assistant.
 
-Answer the question using only the supplied document context.
-If the context does not contain the answer, say:
+Answer using only the supplied document context.
+
+If the answer is unavailable, respond:
 "I could not find that information in the uploaded documents."
 
 Do not invent information.
 
 Question:
-{request.question}
+{masked_question}
 
 Document context:
 {context}
@@ -334,9 +400,15 @@ Document context:
         )
 
         return {
-            "question": request.question,
+            "question": masked_question,
             "answer": interaction.output_text,
-            "sources": matches,
+            "sources": safe_matches,
+            "privacy": {
+                "redactions": redaction_counts,
+                "total_redactions": sum(
+                    redaction_counts.values()
+                ),
+            },
         }
 
     except Exception as error:
@@ -346,4 +418,3 @@ Document context:
             status_code=500,
             detail="Gemini could not answer the question",
         ) from error
-    
