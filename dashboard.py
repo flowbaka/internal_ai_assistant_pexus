@@ -2,95 +2,141 @@ import requests
 import streamlit as st
 
 
-API_BASE_URL = "http://127.0.0.1:8000"
+# Address of our FastAPI backend
+API_URL = "http://127.0.0.1:8000"
 
 
 st.set_page_config(
     page_title="Internal Document Assistant",
     page_icon="📄",
+    layout="centered",
 )
 
-st.title("Privacy-Aware Document Assistant")
+st.title("📄 Privacy-Aware Document Assistant")
 
 st.write(
-    "Upload an internal PDF and ask questions about its contents."
+    "Upload a PDF and ask questions based only on that document."
 )
 
+
+# Store the active document information across Streamlit reruns
+if "document_id" not in st.session_state:
+    st.session_state.document_id = None
+
+if "filename" not in st.session_state:
+    st.session_state.filename = None
+
+
+# ----------------------------
+# PDF UPLOAD SECTION
+# ----------------------------
 
 st.header("1. Upload a document")
 
 uploaded_file = st.file_uploader(
-    "Select a PDF",
+    "Choose a PDF file",
     type=["pdf"],
 )
 
 
-if st.button("Process document"):
-    if uploaded_file is None:
-        st.warning("Please select a PDF first.")
-
-    else:
-        files = {
-            "file": (
-                uploaded_file.name,
-                uploaded_file.getvalue(),
-                "application/pdf",
-            )
-        }
-
-        try:
-            with st.spinner("Processing document..."):
-                response = requests.post(
-                    f"{API_BASE_URL}/documents/extract",
-                    files=files,
-                    timeout=180,
+if st.button(
+    "Upload and process document",
+    disabled=uploaded_file is None,
+):
+    try:
+        with st.spinner("Extracting and indexing the document..."):
+            files = {
+                "file": (
+                    uploaded_file.name,
+                    uploaded_file.getvalue(),
+                    "application/pdf",
                 )
+            }
 
-            if response.status_code == 200:
-                result = response.json()
-
-                st.success("Document processed successfully.")
-
-                st.write({
-                    "filename": result["filename"],
-                    "pages": result["page_count"],
-                    "chunks": result["stored_chunks"],
-                    "document_id": result["document_id"],
-                })
-
-            else:
-                error = response.json()
-                st.error(
-                    error.get(
-                        "detail",
-                        "Document processing failed.",
-                    )
-                )
-
-        except requests.RequestException:
-            st.error(
-                "Could not connect to the FastAPI backend."
+            response = requests.post(
+                f"{API_URL}/documents/extract",
+                files=files,
+                timeout=180,
             )
 
+        if response.status_code == 200:
+            result = response.json()
+
+            # Remember which document is currently active
+            st.session_state.document_id = result["document_id"]
+            st.session_state.filename = result["filename"]
+
+            st.success("Document uploaded successfully!")
+
+            st.write("Filename:", result["filename"])
+            st.write("Pages:", result["page_count"])
+            st.write("Characters:", result["character_count"])
+            st.write("Chunks created:", result["chunk_count"])
+            st.write("Chunks stored:", result["stored_chunks"])
+
+        else:
+            try:
+                error_message = response.json().get(
+                    "detail",
+                    "Document upload failed.",
+                )
+            except ValueError:
+                error_message = response.text
+
+            st.error(error_message)
+
+    except requests.exceptions.ConnectionError:
+        st.error(
+            "Cannot connect to FastAPI. Make sure Uvicorn is running."
+        )
+
+    except requests.exceptions.Timeout:
+        st.error(
+            "The document took too long to process. Please try again."
+        )
+
+    except Exception as error:
+        st.error(f"Unexpected error: {error}")
+
+
+# Show the currently active document
+if st.session_state.document_id:
+    st.info(
+        f"Active document: {st.session_state.filename}"
+    )
+
+
+# ----------------------------
+# QUESTION-ANSWERING SECTION
+# ----------------------------
 
 st.header("2. Ask a question")
 
-question = st.text_input(
-    "Question about the uploaded documents"
+question = st.text_area(
+    "What would you like to know?",
+    placeholder="For example: How many annual leave days are provided?",
+    height=100,
 )
 
 
-if st.button("Ask document"):
-    if not question.strip():
+ask_button = st.button("Ask the document")
+
+
+if ask_button:
+    if not st.session_state.document_id:
+        st.warning("Please upload and process a PDF first.")
+
+    elif not question.strip():
         st.warning("Please enter a question.")
 
     else:
         try:
-            with st.spinner("Searching documents..."):
+            with st.spinner("Searching the document..."):
                 response = requests.post(
-                    f"{API_BASE_URL}/documents/ask",
+                    f"{API_URL}/documents/ask",
                     json={
                         "question": question,
+                        "document_id": st.session_state.document_id,
                     },
                     timeout=180,
                 )
@@ -101,34 +147,69 @@ if st.button("Ask document"):
                 st.subheader("Answer")
                 st.write(result["answer"])
 
-                privacy = result.get("privacy", {})
-
-                st.caption(
-                    "Sensitive values masked: "
-                    f"{privacy.get('total_redactions', 0)}"
+                # Display privacy-masking information if returned
+                redactions = result.get(
+                    "redaction_counts",
+                    result.get("redactions", {}),
                 )
 
-                with st.expander("View sources"):
-                    for source in result["sources"]:
-                        st.write(
-                            f"File: {source['filename']} | "
-                            f"Chunk: {source['chunk_number']} | "
-                            f"Distance: {source['distance']}"
+                if redactions and any(redactions.values()):
+                    st.subheader("Privacy protection")
+                    st.write(
+                        "Sensitive information was masked before "
+                        "sending context to the AI provider."
+                    )
+                    st.json(redactions)
+
+                # Display the retrieved source chunks
+                sources = result.get("sources", [])
+
+                if sources:
+                    st.subheader("Sources")
+
+                    for index, source in enumerate(sources, start=1):
+                        source_name = source.get(
+                            "filename",
+                            st.session_state.filename,
                         )
 
-                        st.write(source["text"])
-                        st.divider()
+                        with st.expander(
+                            f"Source {index}: {source_name}"
+                        ):
+                            if "text" in source:
+                                st.write(source["text"])
+
+                            if "chunk_index" in source:
+                                st.caption(
+                                    f"Chunk: {source['chunk_index']}"
+                                )
+
+                            if "distance" in source:
+                                st.caption(
+                                    f"Vector distance: "
+                                    f"{source['distance']:.4f}"
+                                )
 
             else:
-                error = response.json()
-                st.error(
-                    error.get(
+                try:
+                    error_message = response.json().get(
                         "detail",
-                        "Question answering failed.",
+                        "The question could not be answered.",
                     )
-                )
+                except ValueError:
+                    error_message = response.text
 
-        except requests.RequestException:
+                st.error(error_message)
+
+        except requests.exceptions.ConnectionError:
             st.error(
-                "Could not connect to the FastAPI backend."
+                "Cannot connect to FastAPI. Make sure Uvicorn is running."
             )
+
+        except requests.exceptions.Timeout:
+            st.error(
+                "The AI response took too long. Please try again."
+            )
+
+        except Exception as error:
+            st.error(f"Unexpected error: {error}")

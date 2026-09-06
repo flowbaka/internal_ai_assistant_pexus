@@ -1,128 +1,200 @@
+import io
 import os
+import uuid
 
+import chromadb
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile
 from google import genai
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from uuid import uuid4
 
 from privacy import mask_sensitive_data
 
 
+# -------------------------------------------------
+# APPLICATION CONFIGURATION
+# -------------------------------------------------
 
-import chromadb
-
-
-
-
-# Load variables from the .env file
 load_dotenv()
 
-api_key = os.getenv("Gemini_api_key")
-
-if not api_key:
-    raise RuntimeError(
-        "GEMINI_API_KEY was not found in the .env file"
-    )
-
-
-# Create Gemini client
-client = genai.Client(api_key=api_key)
+app = FastAPI(
+    title="Privacy-Aware Internal Document Assistant",
+    description=(
+        "Upload PDF documents, search them semantically, "
+        "and ask document-grounded questions."
+    ),
+    version="1.0.0",
+)
 
 
-# Load the local Hugging Face embedding model
+# -------------------------------------------------
+# GEMINI CONFIGURATION
+# -------------------------------------------------
+
+api_key = (
+    os.getenv("GEMINI_API_KEY")
+    or os.getenv("Gemini_api_key")
+)
+
+gemini_client = (
+    genai.Client(api_key=api_key)
+    if api_key
+    else None
+)
+
+GEMINI_MODEL = os.getenv(
+    "GEMINI_MODEL",
+    "gemini-3.7-flash",
+)
+
+
+# -------------------------------------------------
+# EMBEDDING MODEL
+# -------------------------------------------------
+
+# This model runs locally on your computer.
+# Each text chunk becomes an embedding containing
+# 384 numerical values.
 embedding_model = SentenceTransformer(
     "sentence-transformers/all-MiniLM-L6-v2"
 )
 
 
-# database and collection setup
+# -------------------------------------------------
+# CHROMADB CONFIGURATION
+# -------------------------------------------------
+
+# PersistentClient saves the vector database
+# inside the chroma_db folder.
 chroma_client = chromadb.PersistentClient(
-    path="./chroma_db"
+    path="chroma_db"
 )
 
-document_collection = chroma_client.get_or_create_collection(
-    name="internal_documents"
-)
-
-# Create FastAPI application
-app = FastAPI(
-    title="Privacy-Aware Internal Document Assistant",
-    description="An AI assistant for internal document question answering",
+document_collection = (
+    chroma_client.get_or_create_collection(
+        name="internal_documents"
+    )
 )
 
 
-# Request model for POST /ask
+# -------------------------------------------------
+# PYDANTIC REQUEST MODELS
+# -------------------------------------------------
+
 class QuestionRequest(BaseModel):
-    question: str
+    question: str = Field(
+        min_length=2,
+        max_length=500,
+    )
 
+
+class DocumentQuestionRequest(BaseModel):
+    question: str = Field(
+        min_length=2,
+        max_length=500,
+    )
+
+    document_id: str = Field(
+        min_length=1,
+    )
+
+
+# -------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------
 
 def split_text(
     text: str,
-    chunk_size: int = 200,
-    overlap: int = 30,
+    chunk_size: int = 1200,
+    overlap: int = 150,
 ) -> list[str]:
+    """
+    Split a long document into smaller overlapping chunks.
+    """
+
     if chunk_size <= 0:
         raise ValueError(
-            "Chunk size must be greater than zero"
+            "chunk_size must be greater than zero"
         )
 
-    if overlap < 0 or overlap >= chunk_size:
+    if overlap < 0:
         raise ValueError(
-            "Overlap must be zero or more and smaller than chunk size"
+            "overlap cannot be negative"
         )
 
-    words = text.split()
+    if overlap >= chunk_size:
+        raise ValueError(
+            "overlap must be smaller than chunk_size"
+        )
+
     chunks = []
     start = 0
 
-    while start < len(words):
-        end = start + chunk_size
+    while start < len(text):
+        end = min(
+            start + chunk_size,
+            len(text),
+        )
 
-        chunk_words = words[start:end]
-        chunk = " ".join(chunk_words)
+        chunk = text[start:end].strip()
 
-        chunks.append(chunk)
+        if chunk:
+            chunks.append(chunk)
 
-        if end >= len(words):
+        # Stop when we reach the end of the document.
+        if end == len(text):
             break
 
+        # Move backwards slightly so the next chunk
+        # shares some text with the previous chunk.
         start = end - overlap
 
     return chunks
 
+
 def create_embeddings(
-    chunks: list[str],
+    texts: list[str],
 ) -> list[list[float]]:
+    """
+    Convert text into numerical embedding vectors.
+    """
+
     embeddings = embedding_model.encode(
-        chunks,
+        texts,
         normalize_embeddings=True,
     )
 
     return embeddings.tolist()
+
 
 def store_document(
     filename: str,
     chunks: list[str],
     embeddings: list[list[float]],
 ) -> str:
-    document_id = str(uuid4())
+    """
+    Store document chunks and embeddings in ChromaDB.
+    """
 
-    chunk_ids = [
-        f"{document_id}_chunk_{index}"
-        for index in range(len(chunks))
-    ]
+    document_id = str(uuid.uuid4())
 
-    metadata = [
-        {
-            "document_id": document_id,
-            "filename": filename,
-            "chunk_number": index,
-        }
-        for index in range(len(chunks))
-    ]
+    chunk_ids = []
+    metadata = []
+
+    for index in range(len(chunks)):
+        chunk_ids.append(
+            f"{document_id}-chunk-{index}"
+        )
+
+        metadata.append(
+            {
+                "document_id": document_id,
+                "filename": filename,
+                "chunk_index": index,
+            }
+        )
 
     document_collection.add(
         ids=chunk_ids,
@@ -134,27 +206,34 @@ def store_document(
     return document_id
 
 
-# create a reusable retriever function for document search
 def retrieve_relevant_chunks(
     question: str,
+    document_id: str,
     number_of_results: int = 3,
 ) -> list[dict]:
-    stored_chunk_count = document_collection.count()
+    """
+    Search only inside the selected document.
+    """
 
-    if stored_chunk_count == 0:
+    if document_collection.count() == 0:
         raise HTTPException(
             status_code=404,
-            detail="No documents have been uploaded",
+            detail="No documents have been uploaded.",
         )
 
-    question_embedding = create_embeddings([question])[0]
+    question_embedding = create_embeddings(
+        [question]
+    )[0]
 
     results = document_collection.query(
         query_embeddings=[question_embedding],
         n_results=min(
             number_of_results,
-            stored_chunk_count,
+            document_collection.count(),
         ),
+        where={
+            "document_id": document_id,
+        },
         include=[
             "documents",
             "metadatas",
@@ -162,153 +241,265 @@ def retrieve_relevant_chunks(
         ],
     )
 
-    matches = []
+    documents = results.get(
+        "documents",
+        [[]],
+    )[0]
 
-    for document, metadata, distance in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
-    ):
-        matches.append({
-            "text": document,
-            "filename": metadata["filename"],
-            "chunk_number": metadata["chunk_number"],
-            "distance": round(float(distance), 4),
-        })
+    metadatas = results.get(
+        "metadatas",
+        [[]],
+    )[0]
 
-    return matches
+    distances = results.get(
+        "distances",
+        [[]],
+    )[0]
 
-def retrieve_relevant_chunks(
-    question: str,
-    number_of_results: int = 3,
-) -> list[dict]:
-    stored_chunk_count = document_collection.count()
-
-    if stored_chunk_count == 0:
+    if not documents:
         raise HTTPException(
             status_code=404,
-            detail="No documents have been uploaded",
+            detail=(
+                "The selected document was not found. "
+                "Please upload it again."
+            ),
         )
-
-    question_embedding = create_embeddings([question])[0]
-
-    results = document_collection.query(
-        query_embeddings=[question_embedding],
-        n_results=min(
-            number_of_results,
-            stored_chunk_count,
-        ),
-        include=[
-            "documents",
-            "metadatas",
-            "distances",
-        ],
-    )
 
     matches = []
 
-    for document, metadata, distance in zip(
-        results["documents"][0],
-        results["metadatas"][0],
-        results["distances"][0],
+    for text, metadata, distance in zip(
+        documents,
+        metadatas,
+        distances,
     ):
-        matches.append({
-            "text": document,
-            "filename": metadata["filename"],
-            "chunk_number": metadata["chunk_number"],
-            "distance": round(float(distance), 4),
-        })
+        matches.append(
+            {
+                "text": text,
+                "filename": metadata.get(
+                    "filename",
+                    "Unknown document",
+                ),
+                "document_id": metadata.get(
+                    "document_id"
+                ),
+                "chunk_index": metadata.get(
+                    "chunk_index"
+                ),
+                "distance": float(distance),
+            }
+        )
 
     return matches
+
+
+def combine_redaction_counts(
+    total_counts: dict,
+    new_counts: dict,
+) -> None:
+    """
+    Add new masking counts to the total counts.
+    """
+
+    for category, count in new_counts.items():
+        total_counts[category] = (
+            total_counts.get(category, 0) + count
+        )
+
+
+def generate_gemini_answer(
+    prompt: str,
+) -> str:
+    """
+    Send a prompt to Gemini and return its answer.
+    """
+
+    if gemini_client is None:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                "Gemini API key is not configured. "
+                "Add GEMINI_API_KEY to your .env file."
+            ),
+        )
+
+    try:
+        response = (
+            gemini_client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+            )
+        )
+
+        if not response.text:
+            raise HTTPException(
+                status_code=502,
+                detail="Gemini returned an empty response.",
+            )
+
+        return response.text
+
+    except HTTPException:
+        raise
+
+    except Exception as error:
+        raise HTTPException(
+            status_code=502,
+            detail=(
+                "Gemini could not process the request: "
+                f"{str(error)}"
+            ),
+        ) from error
+
+
+# -------------------------------------------------
+# BASIC ENDPOINTS
+# -------------------------------------------------
 
 @app.get("/")
-def home():
+def root():
     return {
-        "message": "Internal AI Assistant is running"
+        "message": (
+            "Privacy-Aware Internal Document "
+            "Assistant API"
+        )
     }
 
 
 @app.get("/health")
 def health_check():
     return {
-        "status": "healthy"
+        "status": "healthy",
+        "embedding_model": (
+            "sentence-transformers/"
+            "all-MiniLM-L6-v2"
+        ),
+        "stored_chunks": (
+            document_collection.count()
+        ),
     }
 
 
 @app.post("/ask")
-def ask_question(request: QuestionRequest):
-    try:
-        interaction = client.interactions.create(
-            model="gemini-3.7-flash",
-            input=request.question,
-        )
+def ask_general_ai(
+    request: QuestionRequest,
+):
+    """
+    Ask Gemini a general question without document RAG.
+    """
 
-        return {
-            "question": request.question,
-            "answer": interaction.output_text,
-        }
+    masked_question, redaction_counts = (
+        mask_sensitive_data(request.question)
+    )
 
-    except Exception as error:
-        print(f"Gemini API error: {error}")
+    answer = generate_gemini_answer(
+        masked_question
+    )
 
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini could not generate an answer",
-        ) from error
+    return {
+        "question": request.question,
+        "answer": answer,
+        "redaction_counts": redaction_counts,
+    }
 
+
+# -------------------------------------------------
+# PDF UPLOAD ENDPOINT
+# -------------------------------------------------
 
 @app.post("/documents/extract")
-def extract_document(file: UploadFile):
-    if file.content_type != "application/pdf":
+async def extract_document(
+    file: UploadFile = File(...),
+):
+    """
+    Extract, chunk, embed, and store an uploaded PDF.
+    """
+
+    filename = file.filename or "uploaded_document.pdf"
+
+    is_pdf = (
+        file.content_type == "application/pdf"
+        or filename.lower().endswith(".pdf")
+    )
+
+    if not is_pdf:
         raise HTTPException(
             status_code=400,
-            detail="Only PDF files are allowed",
+            detail="Only PDF files are accepted.",
         )
 
     try:
-        reader = PdfReader(file.file)
+        file_contents = await file.read()
+
+        if not file_contents:
+            raise HTTPException(
+                status_code=400,
+                detail="The uploaded PDF is empty.",
+            )
+
+        # Limit the uploaded file to approximately 10 MB.
+        if len(file_contents) > 10 * 1024 * 1024:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "The PDF is too large. "
+                    "Maximum size is 10 MB."
+                ),
+            )
+
+        pdf_reader = PdfReader(
+            io.BytesIO(file_contents)
+        )
 
         extracted_pages = []
 
-        for page_number, page in enumerate(
-            reader.pages,
-            start=1,
-        ):
+        for page in pdf_reader.pages:
             page_text = page.extract_text() or ""
 
-            extracted_pages.append({
-                "page": page_number,
-                "text": page_text,
-            })
+            if page_text.strip():
+                extracted_pages.append(
+                    page_text.strip()
+                )
 
-        full_text = "\n".join(
-            page["text"] for page in extracted_pages
+        full_text = "\n\n".join(
+            extracted_pages
         )
 
         if not full_text.strip():
             raise HTTPException(
-                status_code=422,
-                detail="The PDF contains no readable text",
+                status_code=400,
+                detail=(
+                    "No readable text was found. "
+                    "The PDF may contain scanned images."
+                ),
             )
 
         chunks = split_text(full_text)
+
         embeddings = create_embeddings(chunks)
 
         document_id = store_document(
-            filename=file.filename or "unnamed.pdf",
+            filename=filename,
             chunks=chunks,
             embeddings=embeddings,
         )
 
         return {
-            "filename": file.filename,
-            "page_count": len(extracted_pages),
+            "filename": filename,
+            "page_count": len(pdf_reader.pages),
             "character_count": len(full_text),
             "chunk_count": len(chunks),
             "chunk_preview": chunks[:2],
             "embedding_count": len(embeddings),
-            "embedding_dimensions": len(embeddings[0]),
-            "embedding_preview": embeddings[0][:5],
+            "embedding_dimensions": (
+                len(embeddings[0])
+                if embeddings
+                else 0
+            ),
+            "embedding_preview": (
+                embeddings[0][:5]
+                if embeddings
+                else []
+            ),
             "document_id": document_id,
             "stored_chunks": len(chunks),
         }
@@ -317,45 +508,78 @@ def extract_document(file: UploadFile):
         raise
 
     except Exception as error:
-        print(f"Document processing error: {error}")
-
         raise HTTPException(
-            status_code=400,
-            detail="The PDF could not be processed",
+            status_code=500,
+            detail=(
+                "The PDF could not be processed: "
+                f"{str(error)}"
+            ),
         ) from error
 
+    finally:
+        await file.close()
+
+
+# -------------------------------------------------
+# SEMANTIC SEARCH ENDPOINT
+# -------------------------------------------------
 
 @app.post("/documents/search")
-def search_documents(request: QuestionRequest):
+def search_documents(
+    request: DocumentQuestionRequest,
+):
+    """
+    Retrieve chunks from one selected document.
+    """
+
     matches = retrieve_relevant_chunks(
-        request.question
+        question=request.question,
+        document_id=request.document_id,
     )
 
     return {
         "question": request.question,
+        "document_id": request.document_id,
+        "match_count": len(matches),
         "matches": matches,
     }
 
 
+# -------------------------------------------------
+# DOCUMENT RAG ENDPOINT
+# -------------------------------------------------
+
 @app.post("/documents/ask")
-def ask_document(request: QuestionRequest):
+def ask_document(
+    request: DocumentQuestionRequest,
+):
+    """
+    Retrieve relevant chunks and ask Gemini to answer
+    using only those chunks.
+    """
+
     matches = retrieve_relevant_chunks(
-        request.question
+        question=request.question,
+        document_id=request.document_id,
     )
 
+    # Mask sensitive information in the question.
     masked_question, redaction_counts = (
         mask_sensitive_data(request.question)
     )
 
     safe_matches = []
 
+    # Mask sensitive information inside every retrieved chunk.
     for match in matches:
         masked_text, chunk_redactions = (
             mask_sensitive_data(match["text"])
         )
 
-        for category, count in chunk_redactions.items():
-            redaction_counts[category] += count
+        combine_redaction_counts(
+            redaction_counts,
+            chunk_redactions,
+        )
 
         safe_match = match.copy()
         safe_match["text"] = masked_text
@@ -364,57 +588,50 @@ def ask_document(request: QuestionRequest):
 
     context_sections = []
 
-    for index, match in enumerate(safe_matches, start=1):
+    for index, match in enumerate(
+        safe_matches,
+        start=1,
+    ):
         source = (
-            f"Source {index}\n"
-            f"Filename: {match['filename']}\n"
-            f"Chunk: {match['chunk_number']}\n"
-            f"Content: {match['text']}"
+            f"Source {index} "
+            f"(chunk {match['chunk_index']})"
         )
 
-        context_sections.append(source)
+        context_sections.append(
+            f"{source}:\n{match['text']}"
+        )
 
-    context = "\n\n".join(context_sections)
+    context = "\n\n".join(
+        context_sections
+    )
 
     prompt = f"""
 You are an internal document assistant.
 
-Answer using only the supplied document context.
+Answer the question using only the document context
+provided below.
 
-If the answer is unavailable, respond:
-"I could not find that information in the uploaded documents."
+If the answer is not present in the context, say:
+"I could not find that information in the document."
 
 Do not invent information.
+Keep the answer clear and concise.
 
-Question:
+DOCUMENT CONTEXT:
+{context}
+
+QUESTION:
 {masked_question}
 
-Document context:
-{context}
+ANSWER:
 """
 
-    try:
-        interaction = client.interactions.create(
-            model="gemini-3.7-flash",
-            input=prompt,
-        )
+    answer = generate_gemini_answer(prompt)
 
-        return {
-            "question": masked_question,
-            "answer": interaction.output_text,
-            "sources": safe_matches,
-            "privacy": {
-                "redactions": redaction_counts,
-                "total_redactions": sum(
-                    redaction_counts.values()
-                ),
-            },
-        }
-
-    except Exception as error:
-        print(f"Gemini RAG error: {error}")
-
-        raise HTTPException(
-            status_code=500,
-            detail="Gemini could not answer the question",
-        ) from error
+    return {
+        "question": request.question,
+        "document_id": request.document_id,
+        "answer": answer,
+        "sources": safe_matches,
+        "redaction_counts": redaction_counts,
+    }
