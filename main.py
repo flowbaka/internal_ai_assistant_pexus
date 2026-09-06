@@ -13,9 +13,9 @@ from sentence_transformers import SentenceTransformer
 from privacy import mask_sensitive_data
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # APPLICATION CONFIGURATION
-# -------------------------------------------------
+# -------------------------------------------
 
 load_dotenv()
 
@@ -29,14 +29,11 @@ app = FastAPI(
 )
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # GEMINI CONFIGURATION
-# -------------------------------------------------
+# -------------------------------------------
 
-api_key = (
-    os.getenv("GEMINI_API_KEY")
-    or os.getenv("Gemini_api_key")
-)
+api_key = os.getenv("GEMINI_API_KEY")
 
 gemini_client = (
     genai.Client(api_key=api_key)
@@ -46,28 +43,23 @@ gemini_client = (
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-3.7-flash",
+    "gemini-3.6-flash",
 )
 
 
-# -------------------------------------------------
-# EMBEDDING MODEL
-# -------------------------------------------------
+# -------------------------------------------
+# LOCAL EMBEDDING MODEL
+# -------------------------------------------
 
-# This model runs locally on your computer.
-# Each text chunk becomes an embedding containing
-# 384 numerical values.
 embedding_model = SentenceTransformer(
     "sentence-transformers/all-MiniLM-L6-v2"
 )
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # CHROMADB CONFIGURATION
-# -------------------------------------------------
+# -------------------------------------------
 
-# PersistentClient saves the vector database
-# inside the chroma_db folder.
 chroma_client = chromadb.PersistentClient(
     path="chroma_db"
 )
@@ -79,9 +71,9 @@ document_collection = (
 )
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # PYDANTIC REQUEST MODELS
-# -------------------------------------------------
+# -------------------------------------------
 
 class QuestionRequest(BaseModel):
     question: str = Field(
@@ -101,18 +93,16 @@ class DocumentQuestionRequest(BaseModel):
     )
 
 
-# -------------------------------------------------
-# HELPER FUNCTIONS
-# -------------------------------------------------
+# -------------------------------------------
+# TEXT CHUNKING
+# -------------------------------------------
 
 def split_text(
     text: str,
     chunk_size: int = 1200,
     overlap: int = 150,
 ) -> list[str]:
-    """
-    Split a long document into smaller overlapping chunks.
-    """
+    """Split a long document into overlapping chunks."""
 
     if chunk_size <= 0:
         raise ValueError(
@@ -143,23 +133,22 @@ def split_text(
         if chunk:
             chunks.append(chunk)
 
-        # Stop when we reach the end of the document.
         if end == len(text):
             break
 
-        # Move backwards slightly so the next chunk
-        # shares some text with the previous chunk.
         start = end - overlap
 
     return chunks
 
 
+# -------------------------------------------
+# EMBEDDING CREATION
+# -------------------------------------------
+
 def create_embeddings(
     texts: list[str],
 ) -> list[list[float]]:
-    """
-    Convert text into numerical embedding vectors.
-    """
+    """Convert text into numerical vectors."""
 
     embeddings = embedding_model.encode(
         texts,
@@ -169,14 +158,16 @@ def create_embeddings(
     return embeddings.tolist()
 
 
+# -------------------------------------------
+# DOCUMENT STORAGE
+# -------------------------------------------
+
 def store_document(
     filename: str,
     chunks: list[str],
     embeddings: list[list[float]],
 ) -> str:
-    """
-    Store document chunks and embeddings in ChromaDB.
-    """
+    """Store chunks and embeddings in ChromaDB."""
 
     document_id = str(uuid.uuid4())
 
@@ -206,14 +197,16 @@ def store_document(
     return document_id
 
 
+# -------------------------------------------
+# DOCUMENT RETRIEVAL
+# -------------------------------------------
+
 def retrieve_relevant_chunks(
     question: str,
     document_id: str,
     number_of_results: int = 3,
 ) -> list[dict]:
-    """
-    Search only inside the selected document.
-    """
+    """Search only inside the selected document."""
 
     if document_collection.count() == 0:
         raise HTTPException(
@@ -292,13 +285,15 @@ def retrieve_relevant_chunks(
     return matches
 
 
+# -------------------------------------------
+# PRIVACY HELPER
+# -------------------------------------------
+
 def combine_redaction_counts(
     total_counts: dict,
     new_counts: dict,
 ) -> None:
-    """
-    Add new masking counts to the total counts.
-    """
+    """Combine masking counts from several chunks."""
 
     for category, count in new_counts.items():
         total_counts[category] = (
@@ -306,12 +301,14 @@ def combine_redaction_counts(
         )
 
 
+# -------------------------------------------
+# GEMINI HELPER
+# -------------------------------------------
+
 def generate_gemini_answer(
     prompt: str,
 ) -> str:
-    """
-    Send a prompt to Gemini and return its answer.
-    """
+    """Send a prompt to Gemini."""
 
     if gemini_client is None:
         raise HTTPException(
@@ -351,9 +348,9 @@ def generate_gemini_answer(
         ) from error
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # BASIC ENDPOINTS
-# -------------------------------------------------
+# -------------------------------------------
 
 @app.get("/")
 def root():
@@ -383,9 +380,7 @@ def health_check():
 def ask_general_ai(
     request: QuestionRequest,
 ):
-    """
-    Ask Gemini a general question without document RAG.
-    """
+    """Ask Gemini without using a document."""
 
     masked_question, redaction_counts = (
         mask_sensitive_data(request.question)
@@ -402,19 +397,20 @@ def ask_general_ai(
     }
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # PDF UPLOAD ENDPOINT
-# -------------------------------------------------
+# -------------------------------------------
 
 @app.post("/documents/extract")
 async def extract_document(
     file: UploadFile = File(...),
 ):
-    """
-    Extract, chunk, embed, and store an uploaded PDF.
-    """
+    """Extract, chunk, embed and store a PDF."""
 
-    filename = file.filename or "uploaded_document.pdf"
+    filename = (
+        file.filename
+        or "uploaded_document.pdf"
+    )
 
     is_pdf = (
         file.content_type == "application/pdf"
@@ -436,7 +432,6 @@ async def extract_document(
                 detail="The uploaded PDF is empty.",
             )
 
-        # Limit the uploaded file to approximately 10 MB.
         if len(file_contents) > 10 * 1024 * 1024:
             raise HTTPException(
                 status_code=413,
@@ -475,7 +470,9 @@ async def extract_document(
 
         chunks = split_text(full_text)
 
-        embeddings = create_embeddings(chunks)
+        embeddings = create_embeddings(
+            chunks
+        )
 
         document_id = store_document(
             filename=filename,
@@ -520,17 +517,15 @@ async def extract_document(
         await file.close()
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # SEMANTIC SEARCH ENDPOINT
-# -------------------------------------------------
+# -------------------------------------------
 
 @app.post("/documents/search")
 def search_documents(
     request: DocumentQuestionRequest,
 ):
-    """
-    Retrieve chunks from one selected document.
-    """
+    """Return relevant document chunks."""
 
     matches = retrieve_relevant_chunks(
         question=request.question,
@@ -545,32 +540,27 @@ def search_documents(
     }
 
 
-# -------------------------------------------------
+# -------------------------------------------
 # DOCUMENT RAG ENDPOINT
-# -------------------------------------------------
+# -------------------------------------------
 
 @app.post("/documents/ask")
 def ask_document(
     request: DocumentQuestionRequest,
 ):
-    """
-    Retrieve relevant chunks and ask Gemini to answer
-    using only those chunks.
-    """
+    """Answer using retrieved document chunks."""
 
     matches = retrieve_relevant_chunks(
         question=request.question,
         document_id=request.document_id,
     )
 
-    # Mask sensitive information in the question.
     masked_question, redaction_counts = (
         mask_sensitive_data(request.question)
     )
 
     safe_matches = []
 
-    # Mask sensitive information inside every retrieved chunk.
     for match in matches:
         masked_text, chunk_redactions = (
             mask_sensitive_data(match["text"])
@@ -626,7 +616,9 @@ QUESTION:
 ANSWER:
 """
 
-    answer = generate_gemini_answer(prompt)
+    answer = generate_gemini_answer(
+        prompt
+    )
 
     return {
         "question": request.question,

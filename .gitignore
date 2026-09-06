@@ -1,4 +1,5 @@
 priawarevenv/
+venv/
 .env
 __pycache__/
 *.pyc
