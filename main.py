@@ -129,6 +129,51 @@ def store_document(
 
     return document_id
 
+
+# create a reusable retriever function for document search
+def retrieve_relevant_chunks(
+    question: str,
+    number_of_results: int = 3,
+) -> list[dict]:
+    stored_chunk_count = document_collection.count()
+
+    if stored_chunk_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="No documents have been uploaded",
+        )
+
+    question_embedding = create_embeddings([question])[0]
+
+    results = document_collection.query(
+        query_embeddings=[question_embedding],
+        n_results=min(
+            number_of_results,
+            stored_chunk_count,
+        ),
+        include=[
+            "documents",
+            "metadatas",
+            "distances",
+        ],
+    )
+
+    matches = []
+
+    for document, metadata, distance in zip(
+        results["documents"][0],
+        results["metadatas"][0],
+        results["distances"][0],
+    ):
+        matches.append({
+            "text": document,
+            "filename": metadata["filename"],
+            "chunk_number": metadata["chunk_number"],
+            "distance": round(float(distance), 4),
+        })
+
+    return matches
+
 @app.get("/")
 def home():
     return {
@@ -231,3 +276,74 @@ def extract_document(file: UploadFile):
             status_code=400,
             detail="The PDF could not be processed",
         ) from error
+
+
+@app.post("/documents/search")
+def search_documents(request: QuestionRequest):
+    matches = retrieve_relevant_chunks(
+        request.question
+    )
+
+    return {
+        "question": request.question,
+        "matches": matches,
+    }
+    stored_chunk_count = document_collection.count()
+
+@app.post("/documents/ask")
+def ask_document(request: QuestionRequest):
+    matches = retrieve_relevant_chunks(
+        request.question
+    )
+
+    context_sections = []
+
+    for index, match in enumerate(matches, start=1):
+        context_sections.append(
+            f"""
+Source {index}
+Filename: {match["filename"]}
+Chunk: {match["chunk_number"]}
+Content:
+{match["text"]}
+"""
+        )
+
+    context = "\n".join(context_sections)
+
+    prompt = f"""
+You are an internal document assistant.
+
+Answer the question using only the supplied document context.
+If the context does not contain the answer, say:
+"I could not find that information in the uploaded documents."
+
+Do not invent information.
+
+Question:
+{request.question}
+
+Document context:
+{context}
+"""
+
+    try:
+        interaction = client.interactions.create(
+            model="gemini-3.7-flash",
+            input=prompt,
+        )
+
+        return {
+            "question": request.question,
+            "answer": interaction.output_text,
+            "sources": matches,
+        }
+
+    except Exception as error:
+        print(f"Gemini RAG error: {error}")
+
+        raise HTTPException(
+            status_code=500,
+            detail="Gemini could not answer the question",
+        ) from error
+    
